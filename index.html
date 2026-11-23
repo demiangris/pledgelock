@@ -1,0 +1,1340 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PledgeLock: milestone-escrow crowdfunding</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible+Mono:wght@400;600&family=Atkinson+Hyperlegible+Next:wght@400;600;700;800&display=swap">
+
+<script type="module">
+import { ethers } from "https://cdn.jsdelivr.net/npm/ethers@6.17.0/dist/ethers.min.js";
+
+// =====================================================================
+//  1. CONFIG: paste the address of your deployed contract here
+//     (Remix -> "Deployed Contracts" -> copy icon). You can also open
+//     the page with ?address=0x... to override it without editing.
+// =====================================================================
+const CONTRACT_ADDRESS = "0x2D093Ab5ba6F0ab9B055969FA1F1367C4917a13e";
+
+// Used to show campaigns before a wallet is connected (set "" to disable).
+const READ_ONLY_RPC = "https://ethereum-sepolia-rpc.publicnode.com";
+const REFRESH_MS = 5000;
+// AI risk badge thresholds (score = launch-day success probability in %).
+const RISK_GREEN_FROM = 70; // 70-100 -> green, low risk
+const RISK_AMBER_FROM = 40; // 40-69  -> amber, medium risk; below 40 -> red
+const SEPOLIA = {
+  chainId: 11155111n,
+  chainIdHex: "0xaa36a7",
+  explorer: "https://sepolia.etherscan.io",
+  rpc: "https://ethereum-sepolia-rpc.publicnode.com",
+};
+
+// =====================================================================
+//  2. MINIMAL ABI (human-readable, only what the page uses)
+// =====================================================================
+const ABI = [
+  // constants & simple getters
+  "function owner() view returns (address)",
+  "function platformFeeBps() view returns (uint256)",
+  "function votingPeriod() view returns (uint256)",
+  "function campaignCount() view returns (uint256)",
+  "function APPROVAL_QUORUM_BPS() view returns (uint256)",
+  "function INACTIVITY_TIMEOUT() view returns (uint256)",
+  "function pendingWithdrawals(address) view returns (uint256)",
+  // views for the front end
+  "function getCampaign(uint256 id) view returns (tuple(address creator, uint64 deadline, uint64 lastActivity, uint8 status, uint8 failReason, uint8 milestoneCount, uint8 currentMilestone, uint8 riskScore, bool riskScored, uint32 backerCount, uint256 goal, uint256 totalRaised, uint256 totalReleased, uint256 refundPool, uint256 refundedWeight, uint256 refundedAmount, string title))",
+  "function getMilestones(uint256 id) view returns (tuple(string description, uint8 percent, uint8 state, uint64 voteEnd, string proofURI, uint256 yesWeight, uint256 noWeight, uint256 amountReleased)[])",
+  "function getBackerInfo(uint256 id, address backer) view returns (uint256 pledged, bool votedOnCurrent, bool refundClaimed, uint256 refundable)",
+  "function getVoteTally(uint256 id) view returns (uint256 milestoneIndex, uint8 state, bool acceptingVotes, uint256 yesWeight, uint256 noWeight, uint256 quorumWeight, uint64 voteEnd, bool wouldPass)",
+  "function nextTranche(uint256 id) view returns (uint256 gross, uint256 fee, uint256 creatorNet)",
+  // transactions
+  "function createCampaign(string title, uint256 goal, uint256 durationSeconds, uint256[] milestonePercents, string[] milestoneDescriptions) returns (uint256 id)",
+  "function setRiskScore(uint256 id, uint256 score)",
+  "function pledge(uint256 id) payable",
+  "function finalize(uint256 id)",
+  "function requestMilestone(uint256 id, string proofURI)",
+  "function vote(uint256 id, bool approve)",
+  "function closeVote(uint256 id)",
+  "function claimRefund(uint256 id)",
+  "function failInactiveCampaign(uint256 id)",
+  "function withdraw()",
+  // event used to find the id of a new campaign
+  "event CampaignCreated(uint256 indexed id, address indexed creator, string title, uint256 goal, uint64 deadline, uint256 milestoneCount)",
+  // custom errors (so reverts can be shown as readable messages)
+  "error NotOwner()",
+  "error NotCreator()",
+  "error NotABacker()",
+  "error InvalidFee(uint256 feeBps)",
+  "error InvalidVotingPeriod()",
+  "error CampaignNotFound(uint256 id)",
+  "error MilestoneNotFound(uint256 index)",
+  "error EmptyTitle()",
+  "error InvalidGoal()",
+  "error InvalidDuration()",
+  "error InvalidMilestoneCount(uint256 count)",
+  "error MilestoneLengthMismatch()",
+  "error InvalidMilestonePercent(uint256 index, uint256 percent)",
+  "error PercentsMustSumTo100(uint256 sum)",
+  "error InvalidRiskScore(uint256 score)",
+  "error WrongStatus(uint8 expected, uint8 actual)",
+  "error DeadlinePassed()",
+  "error DeadlineNotReached(uint256 deadline)",
+  "error ZeroPledge()",
+  "error CreatorCannotPledge()",
+  "error VoteAlreadyOpen()",
+  "error NoOpenVote()",
+  "error EmptyProof()",
+  "error VotingClosed()",
+  "error VotingStillOpen(uint256 voteEnd)",
+  "error AlreadyVoted()",
+  "error AlreadyRefunded()",
+  "error NothingToWithdraw()",
+  "error CreatorStillActive(uint256 inactiveFrom)",
+  "error TransferFailed()",
+  "error ReentrantCall()",
+];
+
+// =====================================================================
+//  3. APP (no need to edit below this line)
+// =====================================================================
+const STATUS = ["Funding", "Active", "Completed", "Failed"];
+const MSTATE = ["Pending", "Voting", "Approved", "Rejected"];
+const FAIL_REASON = ["", "The funding goal was not reached.", "Backers rejected a milestone.", "The creator was inactive for too long."];
+const MAX_LIST = 50;
+const iface = new ethers.Interface(ABI);
+const $ = (sel) => document.querySelector(sel);
+
+const S = {
+  contractAddress: resolveContractAddress(),
+  wallet: null, // ethers.BrowserProvider (MetaMask)
+  readProvider: null,
+  reader: null, // read-only contract
+  writer: null, // contract connected to the MetaMask signer
+  account: null,
+  chainId: null,
+  constants: null,
+  count: 0,
+  campaigns: [],
+  selectedId: readHashId(),
+  detail: null,
+  pending: 0n,
+  blockTs: 0,
+  fetchedAt: 0,
+  loadError: null,
+  loaded: false,
+  inflight: new Set(),
+  form: {},
+  html: {},
+};
+
+function resolveContractAddress() {
+  const fromUrl = new URLSearchParams(location.search).get("address");
+  return (fromUrl || CONTRACT_ADDRESS || "").trim();
+}
+function readHashId() {
+  const m = location.hash.match(/campaign=(\d+)/);
+  return m ? Number(m[1]) : null;
+}
+const onSepolia = () => S.chainId === SEPOLIA.chainId;
+const hasValidAddress = () => ethers.isAddress(S.contractAddress);
+
+// ---------------------------------------------------------------------
+//  Wallet & providers
+// ---------------------------------------------------------------------
+async function setupWallet(requestAccess = false) {
+  const chainBefore = S.chainId;
+  if (window.ethereum) {
+    try {
+      if (requestAccess) await window.ethereum.request({ method: "eth_requestAccounts" });
+      const [accounts, chainHex] = await Promise.all([
+        window.ethereum.request({ method: "eth_accounts" }),
+        window.ethereum.request({ method: "eth_chainId" }),
+      ]);
+      S.chainId = BigInt(chainHex);
+      S.account = accounts && accounts.length ? ethers.getAddress(accounts[0]) : null;
+      S.wallet = new ethers.BrowserProvider(window.ethereum); // new provider after every chain change
+      S.writer = null;
+      if (S.account && onSepolia() && hasValidAddress()) {
+        const signer = await S.wallet.getSigner(S.account);
+        S.writer = new ethers.Contract(S.contractAddress, ABI, signer);
+      }
+    } catch (e) {
+      console.error(e);
+      if (requestAccess) addTx("Connect MetaMask").set("failed", friendlyError(e));
+    }
+  }
+  setupReader();
+  if (S.chainId !== chainBefore) S.constants = null; // owner, fee etc. only change with the network
+  await refresh();
+}
+
+function setupReader() {
+  S.reader = null;
+  S.readProvider = null;
+  if (!hasValidAddress()) return;
+  if (window.ethereum && onSepolia()) {
+    S.readProvider = S.wallet;
+  } else if (READ_ONLY_RPC) {
+    const net = ethers.Network.from(Number(SEPOLIA.chainId));
+    S.readProvider = new ethers.JsonRpcProvider(READ_ONLY_RPC, net, { staticNetwork: net });
+  }
+  if (S.readProvider) S.reader = new ethers.Contract(S.contractAddress, ABI, S.readProvider);
+}
+
+async function switchToSepolia() {
+  try {
+    await window.ethereum.request({ method: "wallet_switchEthereumChain", params: [{ chainId: SEPOLIA.chainIdHex }] });
+  } catch (e) {
+    const code = e?.code ?? e?.data?.originalError?.code;
+    if (code === 4902) {
+      await window.ethereum.request({
+        method: "wallet_addEthereumChain",
+        params: [{
+          chainId: SEPOLIA.chainIdHex,
+          chainName: "Sepolia",
+          nativeCurrency: { name: "Sepolia Ether", symbol: "ETH", decimals: 18 },
+          rpcUrls: [SEPOLIA.rpc],
+          blockExplorerUrls: [SEPOLIA.explorer],
+        }],
+      });
+    } else {
+      addTx("Switch to Sepolia").set("failed", friendlyError(e));
+    }
+  }
+  // MetaMask fires "chainChanged", which calls setupWallet()
+}
+
+// ---------------------------------------------------------------------
+//  Loading data (every REFRESH_MS)
+// ---------------------------------------------------------------------
+let refreshing = false;
+let refreshQueued = false;
+async function refresh() {
+  if (refreshing) { refreshQueued = true; return; }
+  refreshing = true;
+  try {
+    if (!S.reader) return;
+    if (!S.constants) {
+      const code = await S.readProvider.getCode(S.contractAddress);
+      if (code === "0x") {
+        S.loadError = `There is no contract at ${S.contractAddress} on Sepolia. Check CONTRACT_ADDRESS at the top of index.html.`;
+        return;
+      }
+      const [owner, feeBps, votingPeriod, quorumBps, inactivity] = await Promise.all([
+        S.reader.owner(), S.reader.platformFeeBps(), S.reader.votingPeriod(),
+        S.reader.APPROVAL_QUORUM_BPS(), S.reader.INACTIVITY_TIMEOUT(),
+      ]);
+      S.constants = { owner: ethers.getAddress(owner), feeBps, votingPeriod: Number(votingPeriod), quorumBps, inactivity: Number(inactivity) };
+    }
+    const [count, block, pending] = await Promise.all([
+      S.reader.campaignCount(),
+      S.readProvider.getBlock("latest"),
+      S.account ? S.reader.pendingWithdrawals(S.account) : 0n,
+    ]);
+    S.count = Number(count);
+    S.blockTs = Number(block.timestamp);
+    S.fetchedAt = Date.now() / 1000;
+    S.pending = pending;
+
+    const ids = [];
+    for (let i = S.count - 1; i >= 0 && ids.length < MAX_LIST; i--) ids.push(i);
+    const raw = await Promise.all(ids.map((id) => S.reader.getCampaign(id)));
+    S.campaigns = raw.map((r, k) => toCampaign(ids[k], r));
+
+    if (S.selectedId == null || S.selectedId >= S.count) S.selectedId = S.campaigns.length ? S.campaigns[0].id : null;
+    S.detail = S.selectedId != null ? await loadDetail(S.selectedId) : null;
+    S.loadError = null;
+    S.loaded = true;
+  } catch (e) {
+    console.error(e);
+    S.loadError = "Can't load data from Sepolia right now. The page retries every 5 seconds.";
+  } finally {
+    refreshing = false;
+    render();
+    if (refreshQueued) { refreshQueued = false; refresh(); }
+  }
+}
+
+async function loadDetail(id) {
+  const [c, ms, t, b, n] = await Promise.all([
+    S.reader.getCampaign(id),
+    S.reader.getMilestones(id),
+    S.reader.getVoteTally(id),
+    S.account ? S.reader.getBackerInfo(id, S.account) : null,
+    S.reader.nextTranche(id),
+  ]);
+  return {
+    campaign: toCampaign(id, c),
+    milestones: ms.map((m, i) => ({
+      index: i, description: m.description, percent: Number(m.percent), state: Number(m.state),
+      voteEnd: Number(m.voteEnd), proofURI: m.proofURI, yes: m.yesWeight, no: m.noWeight, released: m.amountReleased,
+    })),
+    tally: {
+      index: Number(t.milestoneIndex), state: Number(t.state), accepting: t.acceptingVotes, yes: t.yesWeight,
+      no: t.noWeight, quorum: t.quorumWeight, voteEnd: Number(t.voteEnd), wouldPass: t.wouldPass,
+    },
+    backer: b ? { pledged: b.pledged, voted: b.votedOnCurrent, refundClaimed: b.refundClaimed, refundable: b.refundable }
+              : { pledged: 0n, voted: false, refundClaimed: false, refundable: 0n },
+    next: { gross: n.gross, fee: n.fee, net: n.creatorNet },
+  };
+}
+
+function toCampaign(id, r) {
+  return {
+    id, creator: ethers.getAddress(r.creator), title: r.title, goal: r.goal, totalRaised: r.totalRaised,
+    totalReleased: r.totalReleased, refundPool: r.refundPool, refundedAmount: r.refundedAmount,
+    deadline: Number(r.deadline), lastActivity: Number(r.lastActivity), status: Number(r.status),
+    failReason: Number(r.failReason), milestoneCount: Number(r.milestoneCount), current: Number(r.currentMilestone),
+    riskScore: Number(r.riskScore), riskScored: r.riskScored, backers: Number(r.backerCount),
+  };
+}
+
+// Chain time: local clock, but never behind the latest block (keeps countdowns
+// correct even if the laptop clock is slightly off or the chain is ahead).
+function chainNow() {
+  const local = Date.now() / 1000;
+  if (!S.fetchedAt) return local;
+  return Math.max(local, S.blockTs + (local - S.fetchedAt));
+}
+
+// ---------------------------------------------------------------------
+//  Formatting helpers
+// ---------------------------------------------------------------------
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]));
+}
+function fmtEth(wei, decimals = 4) {
+  wei = BigInt(wei ?? 0);
+  if (wei === 0n) return "0 ETH";
+  const [i, d = ""] = ethers.formatEther(wei).split(".");
+  const frac = d.slice(0, decimals).replace(/0+$/, "");
+  if (i === "0" && !frac) return "< 0." + "0".repeat(decimals - 1) + "1 ETH";
+  return (frac ? `${i}.${frac}` : i) + " ETH";
+}
+function pct(part, whole) {
+  part = BigInt(part); whole = BigInt(whole);
+  if (whole === 0n) return 0;
+  return Number((part * 10000n) / whole) / 100;
+}
+const fmtPct = (p) => (Math.round(p * 10) / 10).toLocaleString("en-GB") + "%";
+const short = (a) => (a ? `${a.slice(0, 6)}…${a.slice(-4)}` : "");
+const sameAddr = (a, b) => !!a && !!b && a.toLowerCase() === b.toLowerCase();
+function fmtDateTime(ts) {
+  return new Date(ts * 1000).toLocaleString("en-GB", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+function fmtCountdown(sec) {
+  sec = Math.max(0, Math.floor(sec));
+  const d = Math.floor(sec / 86400), h = Math.floor((sec % 86400) / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+  if (d > 0) return `${d}d ${h}h ${String(m).padStart(2, "0")}m`;
+  if (h > 0) return `${h}h ${String(m).padStart(2, "0")}m ${String(s).padStart(2, "0")}s`;
+  return `${m}:${String(s).padStart(2, "0")}`;
+}
+function fmtDuration(sec) {
+  if (sec < 120) return `${sec} seconds`;
+  if (sec < 7200) return `${Math.round(sec / 60)} minutes`;
+  if (sec < 172800) return `${Math.round(sec / 3600)} hours`;
+  return `${Math.round(sec / 86400)} days`;
+}
+function proofLink(uri) {
+  const u = String(uri || "").trim();
+  if (/^ipfs:\/\//i.test(u)) return "https://ipfs.io/ipfs/" + u.slice(7);
+  if (/^https?:\/\//i.test(u)) return u;
+  return null; // anything else (e.g. javascript:) is shown as text, never as a link
+}
+const addrLink = (a) => `<a class="mono" href="${SEPOLIA.explorer}/address/${a}" target="_blank" rel="noopener noreferrer" title="${a}">${short(a)}</a>`;
+
+// ---------------------------------------------------------------------
+//  Roles
+// ---------------------------------------------------------------------
+function rolesFor(detail) {
+  const roles = [];
+  if (!S.account) return roles;
+  if (S.constants && sameAddr(S.account, S.constants.owner)) roles.push("Platform owner");
+  if (detail) {
+    if (sameAddr(S.account, detail.campaign.creator)) roles.push("Creator");
+    if (detail.backer.pledged > 0n) roles.push("Backer");
+  }
+  if (!roles.length) roles.push("Visitor");
+  return roles;
+}
+
+// ---------------------------------------------------------------------
+//  Rendering (each region is only rewritten when its HTML changed,
+//  so typing in a field is never interrupted by the auto-refresh)
+// ---------------------------------------------------------------------
+function render() {
+  setRegion("#header-right", headerHtml());
+  setRegion("#banners", bannersHtml());
+  setRegion("#list", listHtml());
+  setRegion("#detail", detailHtml());
+  fillCountdowns();
+}
+
+function setRegion(sel, html) {
+  if (S.html[sel] === html) return;
+  S.html[sel] = html;
+  const el = $(sel);
+  const active = document.activeElement;
+  const focusKey = active && el.contains(active) ? active.dataset.persist || active.dataset.action : null;
+  el.innerHTML = html;
+  el.querySelectorAll("[data-persist]").forEach((input) => {
+    const v = S.form[input.dataset.persist];
+    if (v !== undefined) input.value = v;
+  });
+  if (focusKey) {
+    const again = el.querySelector(`[data-persist="${focusKey}"]`) || el.querySelector(`[data-action="${focusKey}"]`);
+    if (again) again.focus();
+  }
+}
+
+function fillCountdowns() {
+  const now = chainNow();
+  document.querySelectorAll("[data-countdown]").forEach((el) => {
+    const left = Number(el.dataset.countdown) - now;
+    el.textContent = left > 0 ? fmtCountdown(left) : (el.dataset.done || "0:00");
+  });
+}
+
+function headerHtml() {
+  const parts = [];
+  if (!window.ethereum) {
+    parts.push(`<span class="net net-off">No wallet found</span>`);
+  } else if (S.chainId != null && !onSepolia()) {
+    parts.push(`<span class="net net-wrong"><span class="dot" aria-hidden="true"></span>Wrong network</span>`);
+  } else if (S.chainId != null) {
+    parts.push(`<span class="net"><span class="dot" aria-hidden="true"></span>Sepolia</span>`);
+  }
+  if (S.account) {
+    const roles = rolesFor(S.detail);
+    const scope = S.detail ? ` title="Your role in campaign #${S.detail.campaign.id}"` : "";
+    parts.push(`<span class="who"><a class="mono addr" href="${SEPOLIA.explorer}/address/${S.account}" target="_blank" rel="noopener noreferrer" title="${S.account}">${short(S.account)}</a>
+      <span class="roles"${scope}>${roles.map((r) => `<span class="role">${r}</span>`).join("")}</span></span>`);
+    if (S.pending > 0n) {
+      parts.push(`<button class="btn btn-lime" data-action="withdraw" ${S.inflight.has("withdraw") ? "disabled" : ""}>Withdraw ${fmtEth(S.pending)}</button>`);
+    }
+  } else if (window.ethereum) {
+    parts.push(`<button class="btn btn-lime" data-action="connect">Connect MetaMask</button>`);
+  }
+  return parts.join("");
+}
+
+function bannersHtml() {
+  const b = [];
+  if (!hasValidAddress()) {
+    b.push(`<div class="banner banner-setup"><strong>One step left: add your contract address.</strong>
+      Paste the address from Remix into <code>CONTRACT_ADDRESS</code> at the top of <code>web/index.html</code>,
+      or open this page with <code>?address=0x…</code> at the end of the URL.</div>`);
+  }
+  if (!window.ethereum) {
+    b.push(`<div class="banner"><strong>MetaMask was not found.</strong> Install MetaMask and open this page through
+      <code>http://localhost</code> (not as a file). You can still look at campaigns, but not take part.</div>`);
+  } else if (S.chainId != null && !onSepolia()) {
+    b.push(`<div class="banner"><strong>MetaMask is on the wrong network (chain ${S.chainId}).</strong>
+      PledgeLock runs on Sepolia. <button class="btn btn-small btn-lime" data-action="switch-network">Switch to Sepolia</button></div>`);
+  }
+  if (S.loadError) b.push(`<div class="banner banner-error">${esc(S.loadError)}</div>`);
+  return b.join("");
+}
+
+function statusPill(status) {
+  return `<span class="pill st-${STATUS[status].toLowerCase()}">${STATUS[status]}</span>`;
+}
+function riskBadge(c, size = "big") {
+  if (!c.riskScored) return `<span class="risk risk-none risk-${size}"><span class="risk-num">?</span><span class="risk-text">AI score<br>not scored yet</span></span>`;
+  const s = c.riskScore;
+  const level = s >= RISK_GREEN_FROM ? "green" : s >= RISK_AMBER_FROM ? "amber" : "red";
+  const word = { green: "Low risk", amber: "Medium risk", red: "High risk" }[level];
+  if (size === "small") return `<span class="risk risk-${level} risk-small" title="AI success probability ${s}%, ${word.toLowerCase()}">${s}%</span>`;
+  return `<span class="risk risk-${level} risk-big" title="Launch-day success probability from our KNIME model">
+    <span class="risk-num">${s}%</span><span class="risk-text">AI success probability<br><strong>${word}</strong></span></span>`;
+}
+
+function listHtml() {
+  const head = `<div class="list-head"><h2>Campaigns</h2>
+    <button class="btn btn-small btn-lime" data-action="open-create" ${S.writer ? "" : "disabled title=\"Connect MetaMask on Sepolia first\""}>New campaign</button></div>`;
+  if (!S.loaded) return head + `<p class="empty">${hasValidAddress() ? "Loading campaigns…" : "Add the contract address to load campaigns."}</p>`;
+  if (!S.campaigns.length) return head + `<p class="empty">No campaigns yet. Create the first one with <em>New campaign</em>.</p>`;
+  const rows = S.campaigns.map((c) => {
+    const p = Math.min(100, pct(c.totalRaised, c.goal));
+    return `<li><button class="row ${c.id === S.selectedId ? "selected" : ""}" data-action="select" data-id="${c.id}" aria-current="${c.id === S.selectedId}">
+      <span class="row-top"><span class="row-id">#${c.id}</span><span class="row-title">${esc(c.title)}</span>${riskBadge(c, "small")}</span>
+      <span class="row-bar"><span style="width:${p}%"></span></span>
+      <span class="row-bottom"><span>${fmtEth(c.totalRaised)} of ${fmtEth(c.goal)}</span>${statusPill(c.status)}</span>
+    </button></li>`;
+  });
+  return head + `<ul class="rows">${rows.join("")}</ul>`;
+}
+
+function detailHtml() {
+  if (!S.loaded) return `<div class="placeholder"><p>${hasValidAddress() ? "Connecting to Sepolia…" : ""}</p></div>`;
+  const d = S.detail;
+  if (!S.constants) return `<div class="placeholder"><p>Connecting to Sepolia…</p></div>`;
+  if (!d && S.selectedId != null) return `<div class="placeholder"><p>Loading campaign #${S.selectedId}…</p></div>`;
+  if (!d) return `<div class="placeholder"><h2>Nothing to show yet</h2><p>Once a campaign exists, its escrow, milestones and votes appear here.</p></div>`;
+  const c = d.campaign;
+  return `
+    <article class="campaign">
+      <header class="c-head">
+        <div class="c-title">
+          <p class="c-id">Campaign #${c.id}, created by ${addrLink(c.creator)}</p>
+          <h1>${esc(c.title)}</h1>
+          <div class="c-tags">${statusPill(c.status)}${c.status === 3 ? `<span class="fail-reason">${FAIL_REASON[c.failReason]}</span>` : ""}</div>
+        </div>
+        ${riskBadge(c)}
+      </header>
+      ${moneyHtml(d)}
+      <div class="grid2">
+        ${voteHtml(d)}
+        ${actionsHtml(d)}
+      </div>
+      ${milestonesHtml(d)}
+    </article>`;
+}
+
+function moneyHtml(d) {
+  const c = d.campaign;
+  const now = chainNow();
+  const fundingOpen = c.status === 0 && now < c.deadline;
+  const facts = `
+    <dl class="facts">
+      <div><dt>Goal</dt><dd>${fmtEth(c.goal)}</dd></div>
+      <div><dt>Raised</dt><dd>${fmtEth(c.totalRaised)}</dd></div>
+      <div><dt>Backers</dt><dd>${c.backers}</dd></div>
+      <div><dt>${fundingOpen ? "Funding ends in" : "Funding ended"}</dt>
+          <dd>${fundingOpen ? `<span class="tabular" data-countdown="${c.deadline}" data-done="ended"></span>` : fmtDateTime(c.deadline)}</dd></div>
+    </dl>`;
+
+  if (c.status === 0) {
+    const p = pct(c.totalRaised, c.goal);
+    return `<section class="money" aria-label="Funding progress">
+      <div class="money-line"><span class="big">${fmtEth(c.totalRaised)}</span><span>raised of ${fmtEth(c.goal)} goal (${fmtPct(p)})</span></div>
+      <div class="fund-bar"><span style="width:${Math.min(100, p)}%"></span></div>
+      <p class="money-note">All pledges stay locked in the contract. ${fundingOpen ? "If the goal is missed, every backer gets their money back." : "The funding phase is over. Finalize the campaign to see the result."}</p>
+      ${facts}</section>`;
+  }
+
+  // Active / Completed / Failed: escrow bar with one segment per milestone
+  const total = c.totalRaised;
+  let rest = total;
+  const segs = d.milestones.map((m, i) => {
+    const gross = i === d.milestones.length - 1 ? rest : (total * BigInt(m.percent)) / 100n;
+    rest -= gross;
+    let cls = "locked", word = "Locked";
+    if (m.state === 2) { cls = "released"; word = "Released"; }
+    else if (m.state === 1) { cls = "voting"; word = "Voting"; }
+    else if (m.state === 3) { cls = "rejected"; word = "Rejected"; }
+    if (c.status === 3 && m.state !== 2) { cls = m.state === 3 ? "rejected" : "refund"; word = m.state === 3 ? "Rejected" : "Refund pool"; }
+    return `<div class="seg seg-${cls}" style="flex:${m.percent} 1 0%" title="Milestone ${i + 1}: ${m.percent}%, ${fmtEth(gross)}, ${word}">
+      <span class="seg-name">M${i + 1}</span><span class="seg-amt">${fmtEth(gross, 3)}</span><span class="seg-word">${word}</span></div>`;
+  }).join("");
+
+  const locked = c.totalRaised - c.totalReleased;
+  let legend;
+  if (c.status === 3) {
+    legend = `<li><i class="sw sw-released"></i>Released to creator <strong>${fmtEth(c.totalReleased)}</strong></li>
+      <li><i class="sw sw-refund"></i>Refund pool for backers <strong>${fmtEth(c.refundPool)}</strong></li>
+      <li>Already refunded <strong>${fmtEth(c.refundedAmount)}</strong></li>`;
+  } else {
+    legend = `<li><i class="sw sw-released"></i>Released to creator <strong>${fmtEth(c.totalReleased)}</strong></li>
+      <li><i class="sw sw-locked"></i>Still locked in escrow <strong>${fmtEth(locked)}</strong></li>`;
+  }
+  return `<section class="money" aria-label="Where the money is">
+    <div class="money-line">${c.status === 3
+      ? `<span class="big">${fmtEth(c.refundPool - c.refundedAmount)}</span><span>still waiting to be refunded to backers</span>`
+      : c.status === 2
+        ? `<span class="big">${fmtEth(c.totalReleased)}</span><span>released to the creator, milestone by milestone</span>`
+        : `<span class="big">${fmtEth(locked)}</span><span>locked in escrow, released only when backers approve a milestone</span>`}</div>
+    <div class="escrow">${segs}</div>
+    <ul class="legend">${legend}</ul>
+    ${facts}</section>`;
+}
+
+function voteHtml(d) {
+  const c = d.campaign;
+  const t = d.tally;
+  if (c.status === 0 || t.voteEnd === 0) {
+    return `<section class="panel vote vote-empty"><h2>Milestone vote</h2>
+      <p>${c.status === 0 ? "Voting starts after the funding phase, when the creator reports the first milestone." : `No vote yet on milestone ${t.index + 1}. The creator opens it by reporting the milestone with a proof link.`}</p>
+      <p class="rule">A milestone is approved when more pledged ETH votes yes than no, and the yes-votes reach at least ${Number(S.constants.quorumBps) / 100}% of everything raised.</p></section>`;
+  }
+  const m = d.milestones[t.index];
+  const total = c.totalRaised;
+  const yesP = pct(t.yes, total), noP = pct(t.no, total), qP = pct(t.quorum, total);
+  const notVoted = total - t.yes - t.no;
+  const now = chainNow();
+  const open = t.state === 1 && now < t.voteEnd;
+  const awaitingClose = t.state === 1 && now >= t.voteEnd;
+
+  let verdict;
+  if (t.state === 2) verdict = `<p class="verdict pass">Approved. The tranche was released to the creator.</p>`;
+  else if (t.state === 3) verdict = `<p class="verdict fail">Rejected. The campaign failed and backers can claim refunds.</p>`;
+  else if (t.wouldPass) verdict = `<p class="verdict pass">${open ? "Passing right now" : "Will pass"}: more yes than no, and the ${fmtPct(qP)} quorum is met.</p>`;
+  else if (t.yes <= t.no) verdict = `<p class="verdict fail">${open ? "Failing right now" : "Will be rejected"}: yes needs more weight than no.</p>`;
+  else verdict = `<p class="verdict fail">${open ? "Failing right now" : "Will be rejected"}: yes is below the quorum of ${fmtEth(t.quorum)}.</p>`;
+
+  const clock = open
+    ? `<p class="clock"><span class="tabular" data-countdown="${t.voteEnd}" data-done="0:00"></span><span>left to vote</span></p>`
+    : awaitingClose ? `<p class="clock clock-done"><span>Voting has ended.</span><span>Close the vote to apply the result.</span></p>` : "";
+
+  return `<section class="panel vote">
+    <h2>Vote on milestone ${t.index + 1}: ${esc(m.description)}</h2>
+    ${clock}
+    <div class="tally" role="img" aria-label="Yes ${fmtPct(yesP)}, no ${fmtPct(noP)}, quorum ${fmtPct(qP)}">
+      <span class="t-yes" style="width:${yesP}%"></span><span class="t-no" style="width:${noP}%"></span>
+      <span class="t-quorum" style="left:${qP}%"><span>${fmtPct(qP)} quorum</span></span>
+    </div>
+    <ul class="tally-legend">
+      <li><i class="sw sw-yes"></i>Yes <strong>${fmtEth(t.yes)}</strong> (${fmtPct(yesP)})</li>
+      <li><i class="sw sw-no"></i>No <strong>${fmtEth(t.no)}</strong> (${fmtPct(noP)})</li>
+      <li><i class="sw sw-none"></i>Not voted <strong>${fmtEth(notVoted)}</strong></li>
+    </ul>
+    ${verdict}
+  </section>`;
+}
+
+function btn(action, id, label, cls = "btn-lime", extra = "") {
+  const key = `${action}-${id}`;
+  const busy = S.inflight.has(key);
+  return `<button class="btn ${cls}" data-action="${action}" data-id="${id}" ${busy ? "disabled" : ""} ${extra}>${busy ? "Working…" : label}</button>`;
+}
+
+function actionsHtml(d) {
+  const c = d.campaign;
+  const id = c.id;
+  const now = chainNow();
+  const roles = rolesFor(d);
+  const isCreator = roles.includes("Creator");
+  const isBacker = roles.includes("Backer");
+  const isOwner = roles.includes("Platform owner");
+  const items = [];
+
+  if (!S.account) {
+    items.push(`<p>Connect MetaMask to back, vote or manage this campaign.</p>`);
+    if (window.ethereum) items.push(`<button class="btn btn-lime" data-action="connect">Connect MetaMask</button>`);
+  } else if (!S.writer) {
+    items.push(`<p>Switch MetaMask to Sepolia to take part.</p>`);
+  } else if (c.status === 0) {
+    if (now < c.deadline) {
+      if (isCreator) {
+        items.push(`<p>Your campaign is collecting pledges. Creators can't back their own campaign.</p>`);
+      } else {
+        items.push(`<label class="field"><span>Amount to pledge</span>
+          <span class="with-unit"><input data-persist="pledge-${id}" inputmode="decimal" placeholder="0.01" autocomplete="off"><span>ETH</span></span></label>
+          ${btn("pledge", id, isBacker ? "Pledge more" : "Pledge")}
+          <p class="hint">Your ETH is locked in the contract, not sent to the creator.</p>`);
+      }
+    } else {
+      items.push(`<p>The funding phase is over. Anyone can finalize: if the goal was reached, milestones start; if not, refunds open.</p>
+        ${btn("finalize", id, "Finalize funding")}`);
+    }
+  } else if (c.status === 1) {
+    const m = d.milestones[c.current];
+    if (m.state === 1 && now < m.voteEnd) {
+      if (isBacker && !d.backer.voted) {
+        items.push(`<p>Did the creator deliver milestone ${c.current + 1}? Your vote counts with ${fmtEth(d.backer.pledged)}.</p>
+          ${proofHtml(m)}
+          <div class="btn-row">${btn("vote-yes", id, "Vote yes")}${btn("vote-no", id, "Vote no", "btn-red")}</div>`);
+      } else if (isBacker) {
+        items.push(`<p>You have voted on milestone ${c.current + 1}. The result is applied when the vote is closed.</p>`);
+      } else if (isCreator) {
+        items.push(`<p>Backers are voting on milestone ${c.current + 1}.</p>${proofHtml(m)}`);
+      } else {
+        items.push(`<p>Backers are voting on milestone ${c.current + 1}. Only backers of this campaign can vote.</p>`);
+      }
+    } else if (m.state === 1) {
+      items.push(`<p>Voting on milestone ${c.current + 1} has ended. Anyone can close the vote to apply the result.</p>
+        ${btn("close-vote", id, "Close vote")}`);
+    } else {
+      if (isCreator) {
+        items.push(`<p>Report milestone ${c.current + 1} (${esc(m.description)}) when it is done. Backers then have
+          ${fmtDuration(S.constants.votingPeriod)} to vote. If approved you receive ${fmtEth(d.next.net)} (after the ${Number(S.constants.feeBps) / 100}% platform fee).</p>
+          <label class="field"><span>Link to the proof</span>
+          <input data-persist="proof-${id}" placeholder="https://… or ipfs://…" autocomplete="off"></label>
+          ${btn("request", id, `Request vote on milestone ${c.current + 1}`)}`);
+      } else {
+        items.push(`<p>Waiting for the creator to report milestone ${c.current + 1}: ${esc(m.description)}.</p>`);
+      }
+      const inactiveFrom = c.lastActivity + S.constants.inactivity;
+      if (now >= inactiveFrom) {
+        items.push(`<p>The creator has not reported a milestone since ${fmtDateTime(c.lastActivity)}. Anyone can now fail the campaign so backers get the locked funds back.</p>
+          ${btn("fail-inactive", id, "Fail inactive campaign", "btn-red")}`);
+      } else {
+        items.push(`<p class="hint">If the creator does not report the next milestone by ${fmtDateTime(inactiveFrom)}, anyone can fail the campaign and open refunds.</p>`);
+      }
+    }
+  } else if (c.status === 3) {
+    if (isBacker && !d.backer.refundClaimed) {
+      items.push(`<p>This campaign failed. You can take back your share of the funds that are still locked.</p>
+        ${btn("refund", id, `Claim refund of ${fmtEth(d.backer.refundable)}`)}`);
+    } else if (isBacker) {
+      items.push(`<p>You have claimed your refund.</p>`);
+    } else {
+      items.push(`<p>This campaign failed. Its backers can claim their share of the locked funds.</p>`);
+    }
+  } else {
+    items.push(`<p>Every milestone was approved and all funds have been released to the creator.</p>`);
+  }
+
+  if (S.writer && isCreator && S.pending > 0n) {
+    items.push(`<p class="hint">You have ${fmtEth(S.pending)} ready to withdraw (button at the top).</p>`);
+  }
+
+  if (S.writer && isOwner) {
+    items.push(`<div class="owner"><h3>Platform owner: AI risk score</h3>
+      <label class="field"><span>Success probability from the KNIME model (0–100)</span>
+      <span class="with-unit"><input data-persist="risk-${id}" type="number" min="0" max="100" step="1" placeholder="${c.riskScored ? c.riskScore : "e.g. 64"}"><span>%</span></span></label>
+      ${btn("risk", id, c.riskScored ? "Update risk score" : "Save risk score", "btn-outline")}</div>`);
+  }
+
+  const you = S.account && (isBacker || isCreator)
+    ? `<dl class="you">
+        ${isBacker ? `<div><dt>You pledged</dt><dd>${fmtEth(d.backer.pledged)}</dd></div>` : ""}
+        ${isBacker && c.status === 1 ? `<div><dt>Your vote on milestone ${c.current + 1}</dt><dd>${d.backer.voted ? "Cast" : "Not cast yet"}</dd></div>` : ""}
+        ${isBacker && c.status === 3 ? `<div><dt>Refund</dt><dd>${d.backer.refundClaimed ? "Claimed" : fmtEth(d.backer.refundable)}</dd></div>` : ""}
+        ${isCreator ? `<div><dt>Released to you so far</dt><dd>${fmtEth(c.totalReleased - (c.totalReleased * S.constants.feeBps) / 10000n)}</dd></div>` : ""}
+      </dl>` : "";
+
+  return `<section class="panel actions"><h2>What you can do</h2>${items.join("")}${you}</section>`;
+}
+
+function proofHtml(m) {
+  const link = proofLink(m.proofURI);
+  if (!m.proofURI) return "";
+  return link
+    ? `<p class="proof"><a href="${esc(link)}" target="_blank" rel="noopener noreferrer">Open the creator's proof</a></p>`
+    : `<p class="proof">Proof: <span class="mono">${esc(m.proofURI)}</span></p>`;
+}
+
+function milestonesHtml(d) {
+  const c = d.campaign;
+  const total = c.totalRaised > 0n ? c.totalRaised : c.goal;
+  let rest = total;
+  const items = d.milestones.map((m, i) => {
+    const gross = i === d.milestones.length - 1 ? rest : (total * BigInt(m.percent)) / 100n;
+    rest -= gross;
+    const isCurrent = c.status === 1 && i === c.current;
+    const link = proofLink(m.proofURI);
+    const proof = m.proofURI
+      ? (link ? `<a href="${esc(link)}" target="_blank" rel="noopener noreferrer">Proof</a>` : `<span class="mono">${esc(m.proofURI)}</span>`) : "";
+    const result = m.voteEnd ? `<span>Yes ${fmtEth(m.yes)}, no ${fmtEth(m.no)}</span>` : "";
+    return `<li class="ms ms-${MSTATE[m.state].toLowerCase()} ${isCurrent ? "ms-current" : ""}">
+      <span class="ms-num" aria-hidden="true">${i + 1}</span>
+      <div class="ms-body">
+        <p class="ms-title">${esc(m.description)}</p>
+        <p class="ms-meta"><span>${m.percent}% of funds, ${c.totalRaised > 0n ? "" : "about "}${fmtEth(gross)}</span>${result}${proof}</p>
+      </div>
+      <span class="pill ms-pill">${MSTATE[m.state]}</span>
+    </li>`;
+  });
+  return `<section class="panel milestones"><h2>Milestones</h2><ol>${items.join("")}</ol></section>`;
+}
+
+// ---------------------------------------------------------------------
+//  Transactions
+// ---------------------------------------------------------------------
+function addTx(label) {
+  const log = $("#txlog");
+  const li = document.createElement("li");
+  li.className = "tx tx-wallet";
+  li.innerHTML = `<span class="tx-icon" aria-hidden="true"></span><span class="tx-label"></span><span class="tx-msg"></span><a class="tx-link" target="_blank" rel="noopener noreferrer" hidden>View on Etherscan</a>`;
+  li.querySelector(".tx-label").textContent = label;
+  log.prepend(li);
+  while (log.children.length > 3) log.lastElementChild.remove();
+  log.hidden = false;
+  return {
+    set(state, msg, hash) {
+      li.className = `tx tx-${state}`;
+      li.querySelector(".tx-msg").textContent = msg;
+      if (hash) {
+        const a = li.querySelector(".tx-link");
+        a.href = `${SEPOLIA.explorer}/tx/${hash}`;
+        a.hidden = false;
+      }
+    },
+  };
+}
+
+async function sendTx(key, label, build, { onSent, onConfirmed, onError } = {}) {
+  if (S.inflight.has(key)) return;
+  const entry = addTx(label);
+  if (!S.writer) {
+    entry.set("failed", S.account ? "Switch MetaMask to Sepolia first." : "Connect MetaMask first.");
+    return;
+  }
+  S.inflight.add(key);
+  render();
+  entry.set("wallet", "Waiting for you to confirm in MetaMask…");
+  let hash;
+  try {
+    const tx = await build(S.writer);
+    hash = tx.hash;
+    onSent?.(tx);
+    entry.set("pending", "Pending: waiting to be included in a block…", hash);
+    const receipt = await tx.wait();
+    entry.set("confirmed", `Confirmed in block ${receipt.blockNumber}.`, hash);
+    onConfirmed?.(receipt);
+  } catch (e) {
+    console.warn(label, e); // expected failures (rejections, reverts) are shown in the status bar
+    entry.set("failed", friendlyError(e), hash);
+    onError?.(friendlyError(e));
+  } finally {
+    S.inflight.delete(key);
+    await refresh();
+  }
+}
+
+// ---------------------------------------------------------------------
+//  Readable error messages for the contract's custom errors
+// ---------------------------------------------------------------------
+function friendlyError(e) {
+  if (isUserRejection(e)) return "You rejected the request in MetaMask. Nothing was sent.";
+  const decoded = decodeRevert(e);
+  if (decoded) return errorMessage(decoded);
+  const text = String(e?.shortMessage || e?.info?.error?.message || e?.message || e);
+  if (e?.code === "INSUFFICIENT_FUNDS" || /insufficient funds/i.test(text)) return "Not enough Sepolia ETH in this account to pay for this (amount + gas).";
+  if (e?.code === "CALL_EXCEPTION") return "The contract rejected this transaction.";
+  if (e?.code === -32002) return "MetaMask is already waiting for you. Open MetaMask to continue.";
+  return text.length > 160 ? text.slice(0, 157) + "…" : text;
+}
+function isUserRejection(e) {
+  return e?.code === "ACTION_REJECTED" || e?.code === 4001 || e?.info?.error?.code === 4001 || e?.error?.code === 4001;
+}
+function decodeRevert(e) {
+  if (e?.revert?.name) return { name: e.revert.name, args: e.revert.args };
+  const data = findRevertData(e, 0);
+  if (!data) return null;
+  try {
+    const parsed = iface.parseError(data);
+    return parsed ? { name: parsed.name, args: parsed.args } : null;
+  } catch { return null; }
+}
+function findRevertData(x, depth) {
+  if (!x || depth > 6) return null;
+  if (typeof x === "string") return /^0x[0-9a-fA-F]{8}/.test(x) ? x : null;
+  if (typeof x !== "object") return null;
+  for (const k of ["data", "error", "info", "originalError", "cause", "payload"]) {
+    const found = findRevertData(x[k], depth + 1);
+    if (found) return found;
+  }
+  return null;
+}
+function errorMessage({ name, args = [] }) {
+  const a = Array.from(args);
+  const when = (ts) => fmtDateTime(Number(ts));
+  const messages = {
+    NotOwner: "Only the platform owner can do this.",
+    NotCreator: "Only the creator of this campaign can do this.",
+    NotABacker: "Only backers of this campaign can do this.",
+    InvalidFee: "The platform fee can be at most 1000 basis points (10%).",
+    InvalidVotingPeriod: "The voting period must be longer than 0 seconds.",
+    CampaignNotFound: `Campaign #${a[0]} does not exist.`,
+    MilestoneNotFound: `Milestone ${Number(a[0] ?? 0) + 1} does not exist.`,
+    EmptyTitle: "Give the campaign a title.",
+    InvalidGoal: "The funding goal must be more than 0 ETH.",
+    InvalidDuration: "The funding phase must last between 1 second and 365 days.",
+    InvalidMilestoneCount: `A campaign needs 1 to 5 milestones (this one has ${a[0]}).`,
+    MilestoneLengthMismatch: "Every milestone needs both a description and a share.",
+    InvalidMilestonePercent: `Milestone ${Number(a[0] ?? 0) + 1} has a share of ${a[1]}%. Each share must be between 1% and 100%.`,
+    PercentsMustSumTo100: `The milestone shares add up to ${a[0]}%. They must add up to exactly 100%.`,
+    InvalidRiskScore: `A risk score must be between 0 and 100 (got ${a[0]}).`,
+    WrongStatus: `Not possible while the campaign is ${STATUS[Number(a[1])]}. This step needs it to be ${STATUS[Number(a[0])]}.`,
+    DeadlinePassed: "The funding phase has ended, so pledges are closed. Finalize the campaign instead.",
+    DeadlineNotReached: `The funding phase is still running until ${when(a[0])}.`,
+    ZeroPledge: "Enter an amount greater than 0 ETH.",
+    CreatorCannotPledge: "Creators can't back their own campaign.",
+    VoteAlreadyOpen: "A vote is already open for this campaign.",
+    NoOpenVote: "There is no open vote. The creator has to report a milestone first.",
+    EmptyProof: "Add a link to the proof for this milestone.",
+    VotingClosed: "Voting has ended. Close the vote to apply the result.",
+    VotingStillOpen: `Voting is still open until ${when(a[0])}.`,
+    AlreadyVoted: "You have already voted on this milestone.",
+    AlreadyRefunded: "You have already claimed your refund.",
+    NothingToWithdraw: "There is nothing to withdraw for this account.",
+    CreatorStillActive: `The creator is not inactive yet. This becomes possible on ${when(a[0])}.`,
+    TransferFailed: "Sending ETH to your address failed.",
+    ReentrantCall: "Blocked by the reentrancy guard.",
+  };
+  return messages[name] || `The contract rejected the transaction (${name}).`;
+}
+
+// ---------------------------------------------------------------------
+//  Actions
+// ---------------------------------------------------------------------
+function readEth(key) {
+  const raw = String(S.form[key] ?? "").trim().replace(",", ".");
+  if (!/^\d*\.?\d+$/.test(raw)) return null;
+  try { const v = ethers.parseEther(raw); return v > 0n ? { wei: v, text: raw } : null; } catch { return null; }
+}
+
+const ACTIONS = {
+  connect: () => setupWallet(true),
+  "switch-network": () => switchToSepolia(),
+  "open-create": () => openCreate(),
+  select: (id) => {
+    S.selectedId = id;
+    history.replaceState(null, "", `${location.pathname}${location.search}#campaign=${id}`);
+    S.detail = S.detail && S.detail.campaign.id === id ? S.detail : null;
+    render();
+    refresh();
+  },
+  withdraw: () => sendTx("withdraw", `Withdraw ${fmtEth(S.pending)}`, (c) => c.withdraw()),
+  pledge: (id) => {
+    const amount = readEth(`pledge-${id}`);
+    if (!amount) return addTx(`Pledge to #${id}`).set("failed", "Enter an amount in ETH, for example 0.01.");
+    sendTx(`pledge-${id}`, `Pledge ${amount.text} ETH to #${id}`, (c) => c.pledge(id, { value: amount.wei }), {
+      onSent: () => { S.form[`pledge-${id}`] = ""; S.html = {}; },
+    });
+  },
+  finalize: (id) => sendTx(`finalize-${id}`, `Finalize funding of #${id}`, (c) => c.finalize(id)),
+  request: (id) => {
+    const proof = String(S.form[`proof-${id}`] ?? "").trim();
+    if (!proof) return addTx(`Request milestone vote on #${id}`).set("failed", "Add a link to the proof first (https://… or ipfs://…).");
+    sendTx(`request-${id}`, `Request milestone vote on #${id}`, (c) => c.requestMilestone(id, proof), {
+      onSent: () => { S.form[`proof-${id}`] = ""; S.html = {}; },
+    });
+  },
+  "vote-yes": (id) => sendTx(`vote-yes-${id}`, `Vote yes on #${id}`, (c) => c.vote(id, true)),
+  "vote-no": (id) => sendTx(`vote-no-${id}`, `Vote no on #${id}`, (c) => c.vote(id, false)),
+  "close-vote": (id) => sendTx(`close-vote-${id}`, `Close vote on #${id}`, (c) => c.closeVote(id)),
+  refund: (id) => sendTx(`refund-${id}`, `Claim refund from #${id}`, (c) => c.claimRefund(id)),
+  "fail-inactive": (id) => sendTx(`fail-inactive-${id}`, `Fail inactive campaign #${id}`, (c) => c.failInactiveCampaign(id)),
+  risk: (id) => {
+    const raw = String(S.form[`risk-${id}`] ?? "").trim();
+    if (!/^\d{1,3}$/.test(raw) || Number(raw) > 100) return addTx(`Set risk score of #${id}`).set("failed", "Enter a whole number from 0 to 100.");
+    sendTx(`risk-${id}`, `Set risk score of #${id} to ${raw}%`, (c) => c.setRiskScore(id, Number(raw)), {
+      onSent: () => { S.form[`risk-${id}`] = ""; S.html = {}; },
+    });
+  },
+};
+
+// ---------------------------------------------------------------------
+//  Create-campaign dialog
+// ---------------------------------------------------------------------
+const dlg = () => $("#create-dialog");
+function openCreate() {
+  if (!S.writer) return addTx("New campaign").set("failed", "Connect MetaMask on Sepolia first.");
+  if (!$("#cf-milestones").children.length) { addMilestoneRow("", 40); addMilestoneRow("", 60); }
+  $("#cf-error").textContent = "";
+  updateSum();
+  dlg().showModal();
+  $("#cf-title").focus();
+}
+function addMilestoneRow(desc = "", percent = "") {
+  const list = $("#cf-milestones");
+  if (list.children.length >= 5) return;
+  const li = document.createElement("li");
+  li.className = "cf-row";
+  li.innerHTML = `<input class="cf-desc" placeholder="What will be delivered?" aria-label="Milestone description" maxlength="120">
+    <span class="with-unit cf-pct-wrap"><input class="cf-pct" type="number" min="1" max="100" step="1" aria-label="Share of funds in percent"><span>%</span></span>
+    <button type="button" class="btn btn-small btn-outline cf-remove">Remove</button>`;
+  li.querySelector(".cf-desc").value = desc;
+  li.querySelector(".cf-pct").value = percent;
+  list.append(li);
+  updateSum();
+}
+function readMilestones() {
+  return [...$("#cf-milestones").children].map((li) => ({
+    desc: li.querySelector(".cf-desc").value.trim(),
+    pct: li.querySelector(".cf-pct").value.trim(),
+  }));
+}
+function updateSum() {
+  const rows = readMilestones();
+  const sum = rows.reduce((s, r) => s + (Number(r.pct) || 0), 0);
+  const el = $("#cf-sum");
+  el.textContent = `Shares add up to ${sum}%${sum === 100 ? "" : " (must be 100%)"}`;
+  el.className = sum === 100 ? "sum-ok" : "sum-bad";
+  $("#cf-add").disabled = rows.length >= 5;
+  document.querySelectorAll(".cf-remove").forEach((b) => (b.disabled = rows.length <= 1));
+}
+function submitCreate(ev) {
+  ev.preventDefault();
+  const err = (msg) => { $("#cf-error").textContent = msg; };
+  const title = $("#cf-title").value.trim();
+  const goalRaw = $("#cf-goal").value.trim().replace(",", ".");
+  const duration = Math.floor(Number($("#cf-duration").value) * Number($("#cf-unit").value));
+  const rows = readMilestones();
+  if (!title) return err("Give the campaign a title.");
+  let goal;
+  try { goal = /^\d*\.?\d+$/.test(goalRaw) ? ethers.parseEther(goalRaw) : 0n; } catch { goal = 0n; }
+  if (goal <= 0n) return err("Enter a funding goal in ETH, for example 0.03.");
+  if (!(duration >= 1 && duration <= 365 * 86400)) return err("The funding phase must last between 1 second and 365 days.");
+  if (rows.some((r) => !r.desc)) return err("Every milestone needs a description.");
+  if (rows.some((r) => !/^\d+$/.test(r.pct) || Number(r.pct) < 1 || Number(r.pct) > 100)) return err("Each share must be a whole number from 1 to 100.");
+  const sum = rows.reduce((s, r) => s + Number(r.pct), 0);
+  if (sum !== 100) return err(`The shares add up to ${sum}%. They must add up to exactly 100%.`);
+  err("");
+  sendTx("create", `Create campaign "${title}"`,
+    (c) => c.createCampaign(title, goal, duration, rows.map((r) => Number(r.pct)), rows.map((r) => r.desc)), {
+      onSent: () => { dlg().close(); $("#create-form").reset(); $("#cf-milestones").innerHTML = ""; },
+      onError: (msg) => { if (dlg().open) err(msg); },
+      onConfirmed: (receipt) => {
+        for (const log of receipt.logs) {
+          try {
+            const parsed = iface.parseLog(log);
+            if (parsed?.name === "CampaignCreated") ACTIONS.select(Number(parsed.args.id));
+          } catch { /* log from another contract */ }
+        }
+      },
+    });
+}
+
+// ---------------------------------------------------------------------
+//  Events & start
+// ---------------------------------------------------------------------
+document.addEventListener("click", (ev) => {
+  const el = ev.target.closest("[data-action]");
+  if (!el || el.disabled) return;
+  const fn = ACTIONS[el.dataset.action];
+  if (fn) fn(el.dataset.id !== undefined ? Number(el.dataset.id) : undefined);
+});
+document.addEventListener("input", (ev) => {
+  const key = ev.target.dataset?.persist;
+  if (key) S.form[key] = ev.target.value;
+});
+document.addEventListener("keydown", (ev) => {
+  if (ev.key !== "Enter") return;
+  const key = ev.target.dataset?.persist;
+  if (!key) return;
+  const panel = ev.target.closest(".panel");
+  if (!panel) return;
+  const next = [...panel.querySelectorAll("button[data-action]")]
+    .find((b) => ev.target.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING);
+  if (next && !next.disabled) next.click();
+});
+$("#cf-add").addEventListener("click", () => addMilestoneRow());
+$("#cf-milestones").addEventListener("input", updateSum);
+$("#create-form").addEventListener("input", () => { $("#cf-error").textContent = ""; });
+$("#cf-milestones").addEventListener("click", (ev) => {
+  if (ev.target.classList.contains("cf-remove") && $("#cf-milestones").children.length > 1) { ev.target.closest("li").remove(); updateSum(); }
+});
+$("#cf-cancel").addEventListener("click", () => dlg().close());
+$("#create-form").addEventListener("submit", submitCreate);
+
+if (window.ethereum) {
+  window.ethereum.on?.("accountsChanged", () => setupWallet());
+  window.ethereum.on?.("chainChanged", () => setupWallet());
+}
+setupWallet();
+setInterval(refresh, REFRESH_MS);
+setInterval(() => { render(); }, 1000); // countdowns + actions that unlock at a deadline
+</script>
+
+<style>
+:root {
+  --navy: #183E55;
+  --navy-2: #24566F;
+  --sky: #B3CED6;
+  --sky-2: #D5E4E9;
+  --sky-3: #EDF3F5;
+  --lime: #DFF37C;
+  --lime-2: #CDE55C;
+  --paper: #F6F9FA;
+  --white: #FFFFFF;
+  --muted: #47616F;
+  --red: #B42318;
+  --red-soft: #FCE6E3;
+  --amber: #E2A400;
+  --amber-soft: #FDF1CC;
+  --green: #2B7A4B;
+  --radius: 6px;
+  --font: "Atkinson Hyperlegible Next", "Atkinson Hyperlegible", system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+  --mono: "Atkinson Hyperlegible Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+* { box-sizing: border-box; }
+html { font-size: 18px; }
+body { margin: 0; background: var(--paper); color: var(--navy); font-family: var(--font); line-height: 1.45; -webkit-font-smoothing: antialiased; }
+h1, h2, h3, p { margin: 0; }
+a { color: var(--navy); text-decoration-thickness: 2px; text-underline-offset: 3px; }
+code { font-family: var(--mono); font-size: .9em; background: var(--sky-3); padding: 1px 5px; border-radius: 4px; }
+.mono { font-family: var(--mono); }
+.tabular { font-variant-numeric: tabular-nums; }
+:focus-visible { outline: 3px solid var(--navy); outline-offset: 3px; }
+.topbar :focus-visible, #txlog :focus-visible { outline-color: var(--lime); }
+
+/* ---------- top bar ---------- */
+.topbar { background: var(--navy); color: var(--white); }
+.topbar-inner { max-width: 1520px; margin: 0 auto; padding: 14px 28px; display: flex; align-items: center; gap: 24px; justify-content: space-between; flex-wrap: wrap; }
+.brand { display: flex; align-items: center; gap: 12px; text-decoration: none; color: var(--white); }
+.brand svg { width: 34px; height: 34px; flex: none; }
+.brand-name { font-size: 1.55rem; font-weight: 800; letter-spacing: -0.01em; }
+.brand-sub { font-size: .85rem; color: var(--sky); margin-left: 4px; }
+#header-right { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+.net { display: inline-flex; align-items: center; gap: 8px; font-weight: 600; color: var(--sky); }
+.net .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--lime); }
+.net-off { color: var(--sky); }
+.net-wrong .dot { background: var(--amber); }
+.who { display: inline-flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.addr { color: var(--white); font-size: .95rem; }
+.roles { display: inline-flex; gap: 6px; }
+.role { background: var(--white); color: var(--navy); font-weight: 700; font-size: .85rem; padding: 3px 10px; border-radius: 999px; }
+
+/* ---------- buttons & fields ---------- */
+.btn { font: inherit; font-weight: 700; font-size: 1rem; line-height: 1.2; padding: 12px 20px; border-radius: var(--radius); border: 2px solid var(--navy); background: var(--white); color: var(--navy); cursor: pointer; }
+.btn:hover:not(:disabled) { background: var(--sky-3); }
+.btn:disabled { opacity: .55; cursor: not-allowed; }
+.btn-lime { background: var(--lime); }
+.btn-lime:hover:not(:disabled) { background: var(--lime-2); }
+.topbar .btn-lime { border-color: var(--lime); }
+.btn-red { background: var(--red); border-color: var(--red); color: var(--white); }
+.btn-red:hover:not(:disabled) { background: #93190F; }
+.btn-outline { background: var(--white); }
+.btn-small { padding: 7px 14px; font-size: .9rem; }
+.btn-row { display: flex; gap: 12px; flex-wrap: wrap; }
+.field { display: grid; gap: 6px; font-weight: 600; }
+.field > span:first-child { font-size: .9rem; color: var(--muted); }
+input, select { font: inherit; color: var(--navy); background: var(--white); border: 2px solid var(--sky); border-radius: var(--radius); padding: 10px 12px; min-width: 0; }
+input:focus, select:focus { border-color: var(--navy); outline: none; box-shadow: 0 0 0 3px var(--lime); }
+.with-unit { display: flex; align-items: center; gap: 8px; }
+.with-unit input { flex: 1; }
+.with-unit > span { font-weight: 700; }
+
+/* ---------- layout ---------- */
+#banners { max-width: 1520px; margin: 0 auto; padding: 0 28px; }
+#banners:empty { display: none; }
+.banner { margin-top: 16px; padding: 14px 18px; border-radius: var(--radius); background: var(--amber-soft); border: 2px solid var(--amber); display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.banner-setup { background: var(--lime); border-color: var(--navy); }
+.banner-error { background: var(--red-soft); border-color: var(--red); }
+.app { max-width: 1520px; margin: 0 auto; padding: 24px 28px 150px; display: grid; grid-template-columns: 340px minmax(0, 1fr); gap: 32px; align-items: start; }
+
+/* ---------- campaign list ---------- */
+.list-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 12px; }
+.list-head h2 { font-size: 1.3rem; }
+.rows { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+#list { min-width: 0; position: sticky; top: 16px; max-height: calc(100vh - 140px); overflow-y: auto; padding: 2px 4px 2px 2px; }
+#detail { min-width: 0; }
+.row { width: 100%; min-width: 0; grid-template-columns: minmax(0, 1fr); text-align: left; font: inherit; color: inherit; cursor: pointer; display: grid; gap: 8px; padding: 14px 16px; background: transparent; border: 2px solid transparent; border-left: 6px solid var(--sky); border-radius: var(--radius); }
+.row:hover { background: var(--white); }
+.row.selected { background: var(--white); border-color: var(--sky); border-left-color: var(--navy); }
+.row-top { display: flex; gap: 8px; align-items: baseline; min-width: 0; }
+.row-id { color: var(--muted); font-weight: 700; }
+.row-title { font-weight: 700; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.row-bar { height: 8px; background: var(--sky-2); border-radius: 4px; overflow: hidden; }
+.row-bar span { display: block; height: 100%; background: var(--navy); }
+.row-bottom { display: flex; justify-content: space-between; align-items: center; gap: 8px; font-size: .9rem; color: var(--muted); }
+.empty { color: var(--muted); padding: 12px 0; }
+
+/* ---------- pills & badges ---------- */
+.pill { display: inline-block; font-weight: 700; font-size: .85rem; padding: 3px 12px; border-radius: 999px; border: 2px solid transparent; white-space: nowrap; }
+.st-funding { background: var(--sky-2); }
+.st-active { background: var(--lime); border-color: var(--navy); }
+.st-completed { background: var(--navy); color: var(--lime); }
+.st-failed { background: var(--red-soft); color: var(--red); border-color: var(--red); }
+.risk { display: inline-flex; align-items: center; gap: 12px; border-radius: var(--radius); }
+.risk-big { padding: 10px 16px; border: 2px solid currentColor; background: var(--white); }
+.risk-big .risk-num { font-size: 2rem; font-weight: 800; line-height: 1; }
+.risk-big .risk-text { font-size: .85rem; line-height: 1.25; }
+.risk-small { font-weight: 800; font-size: .85rem; padding: 2px 8px; border-radius: 999px; color: var(--white); }
+.risk-green { color: var(--green); } .risk-small.risk-green { background: var(--green); color: var(--white); }
+.risk-amber { color: #8A6400; } .risk-big.risk-amber { background: var(--amber-soft); border-color: var(--amber); } .risk-small.risk-amber { background: var(--amber); color: var(--navy); }
+.risk-red { color: var(--red); } .risk-small.risk-red { background: var(--red); color: var(--white); }
+.risk-none { color: var(--muted); } .risk-big.risk-none { border-style: dashed; border-color: var(--sky); }
+.risk-small.risk-none { display: none; }
+
+/* ---------- campaign detail ---------- */
+.placeholder { padding: 60px 0; color: var(--muted); display: grid; gap: 8px; }
+.placeholder h2 { color: var(--navy); }
+.campaign { display: grid; gap: 24px; }
+.c-head { display: flex; justify-content: space-between; gap: 24px; align-items: flex-start; flex-wrap: wrap; }
+.c-title { display: grid; gap: 8px; min-width: 0; }
+.c-id { color: var(--muted); }
+.c-head h1 { font-size: 2.6rem; line-height: 1.05; font-weight: 800; letter-spacing: -0.02em; overflow-wrap: anywhere; }
+.c-tags { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+.fail-reason { color: var(--red); font-weight: 600; }
+
+/* the hero: where the money is */
+.money { background: var(--white); border: 2px solid var(--sky); border-radius: var(--radius); padding: 22px 24px; display: grid; gap: 14px; }
+.money-line { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; }
+.money-line .big { font-size: 2.2rem; font-weight: 800; font-variant-numeric: tabular-nums; }
+.money-note { color: var(--muted); }
+.fund-bar { height: 40px; background: var(--sky-2); border-radius: var(--radius); overflow: hidden; }
+.fund-bar span { display: block; height: 100%; background: var(--navy); transition: width .6s ease; }
+.escrow { display: flex; gap: 4px; height: 92px; }
+.seg { min-width: 0; border-radius: var(--radius); padding: 10px 12px; display: grid; align-content: space-between; overflow: hidden; color: var(--white); background: var(--navy); }
+.seg span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.seg-name { font-weight: 800; }
+.seg-amt { font-variant-numeric: tabular-nums; }
+.seg-word { font-size: .85rem; }
+.seg-released { background: var(--lime); color: var(--navy); }
+.seg-voting { color: var(--navy); background: repeating-linear-gradient(135deg, var(--sky) 0 14px, var(--sky-2) 14px 28px); background-size: 200% 100%; animation: drift 4s linear infinite; }
+.seg-rejected { background: var(--red); }
+.seg-refund { color: var(--navy); background: repeating-linear-gradient(135deg, var(--white) 0 10px, var(--sky-2) 10px 20px); border: 2px solid var(--sky); }
+@keyframes drift { to { background-position: -80px 0; } }
+.legend, .tally-legend { list-style: none; margin: 0; padding: 0; display: flex; gap: 22px; flex-wrap: wrap; }
+.legend li, .tally-legend li { display: inline-flex; align-items: center; gap: 8px; }
+.sw { display: inline-block; width: 16px; height: 16px; border-radius: 3px; }
+.sw-released, .sw-yes { background: var(--lime); border: 2px solid var(--navy); }
+.sw-locked { background: var(--navy); }
+.sw-refund { background: repeating-linear-gradient(135deg, var(--white) 0 3px, var(--sky) 3px 6px); border: 2px solid var(--sky); }
+.sw-no { background: var(--red); }
+.sw-none { background: var(--sky-3); border: 2px solid var(--sky); }
+.facts { margin: 4px 0 0; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 16px; border-top: 2px solid var(--sky-3); padding-top: 14px; }
+.facts dt, .you dt { color: var(--muted); font-size: .85rem; }
+.facts dd, .you dd { margin: 0; font-weight: 700; font-size: 1.15rem; }
+
+.grid2 { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr); gap: 24px; align-items: start; }
+.panel { background: var(--white); border: 2px solid var(--sky); border-radius: var(--radius); padding: 20px 22px; display: grid; gap: 14px; }
+.panel h2 { font-size: 1.25rem; }
+.panel h3 { font-size: 1rem; }
+.hint, .rule { color: var(--muted); font-size: .92rem; }
+
+/* vote */
+.vote-empty p:first-of-type { font-size: 1.05rem; }
+.clock { display: flex; align-items: baseline; gap: 12px; }
+.clock .tabular { font-size: 3rem; font-weight: 800; line-height: 1; }
+.clock-done { display: grid; gap: 2px; font-weight: 700; background: var(--amber-soft); border-left: 6px solid var(--amber); padding: 10px 14px; border-radius: var(--radius); }
+.tally { position: relative; height: 44px; margin-top: 26px; background: var(--sky-3); border: 2px solid var(--sky); border-radius: var(--radius); display: flex; }
+.tally .t-yes { background: var(--lime); border-right: 2px solid var(--navy); }
+.tally .t-yes[style="width:0%"] { border-right: 0; }
+.tally .t-no { background: var(--red); }
+.t-quorum { position: absolute; top: -26px; bottom: -6px; width: 0; border-left: 3px solid var(--navy); }
+.t-quorum span { position: absolute; top: 0; left: 6px; font-size: .8rem; font-weight: 700; white-space: nowrap; }
+.verdict { font-weight: 700; padding: 10px 14px; border-radius: var(--radius); }
+.verdict.pass { background: var(--lime); }
+.verdict.fail { background: var(--red-soft); color: var(--red); }
+
+/* actions */
+.actions p { font-size: 1.02rem; }
+.owner { border-top: 2px dashed var(--sky); padding-top: 14px; display: grid; gap: 10px; }
+.you { margin: 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; border-top: 2px solid var(--sky-3); padding-top: 12px; }
+.proof a { font-weight: 700; }
+
+/* milestones (a real sequence, hence numbered) */
+.milestones ol { list-style: none; margin: 0; padding: 0; display: grid; gap: 4px; }
+.ms { display: grid; grid-template-columns: 44px minmax(0, 1fr) auto; gap: 14px; align-items: center; padding: 12px 6px; border-bottom: 2px solid var(--sky-3); }
+.ms:last-child { border-bottom: 0; }
+.ms-num { width: 40px; height: 40px; border-radius: 50%; display: grid; place-items: center; font-weight: 800; border: 2px solid var(--sky); }
+.ms-title { font-weight: 700; }
+.ms-meta { color: var(--muted); font-size: .92rem; display: flex; gap: 16px; flex-wrap: wrap; }
+.ms-approved .ms-num { background: var(--lime); border-color: var(--navy); }
+.ms-approved .ms-pill { background: var(--lime); border-color: var(--navy); }
+.ms-voting .ms-num, .ms-voting .ms-pill { background: var(--sky); border-color: var(--sky); }
+.ms-rejected .ms-num { background: var(--red); border-color: var(--red); color: var(--white); }
+.ms-rejected .ms-pill { background: var(--red-soft); color: var(--red); border-color: var(--red); }
+.ms-pending .ms-pill { border-color: var(--sky); }
+.ms-current { background: var(--sky-3); border-radius: var(--radius); }
+
+/* ---------- transaction status bar ---------- */
+#txlog { position: fixed; left: 0; right: 0; bottom: 0; margin: 0; padding: 10px 28px 12px; list-style: none; background: var(--navy); color: var(--white); display: grid; gap: 4px; z-index: 10; }
+#txlog[hidden] { display: none; }
+.tx { display: grid; grid-template-columns: 22px auto minmax(0, 1fr) auto; gap: 12px; align-items: center; max-width: 1464px; margin: 0 auto; width: 100%; }
+.tx:not(:first-child) { opacity: .62; font-size: .88rem; }
+.tx-label { font-weight: 700; }
+.tx-msg { overflow-wrap: anywhere; }
+.tx-link { color: var(--lime); font-weight: 700; white-space: nowrap; }
+.tx-icon { width: 18px; height: 18px; border-radius: 50%; border: 3px solid var(--sky); }
+.tx-wallet .tx-icon { border-color: var(--lime); border-style: dotted; }
+.tx-pending .tx-icon { border-color: var(--sky); border-top-color: var(--lime); animation: spin 1s linear infinite; }
+.tx-confirmed .tx-icon { background: var(--lime); border-color: var(--lime); }
+.tx-failed .tx-icon { background: var(--red); border-color: #F28B82; }
+.tx-failed .tx-msg { color: #FFD7D2; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ---------- dialog ---------- */
+dialog { border: 0; border-radius: var(--radius); padding: 0; width: min(760px, calc(100vw - 32px)); color: var(--navy); }
+dialog::backdrop { background: rgba(24, 62, 85, .55); }
+#create-form { padding: 26px 28px; display: grid; gap: 18px; }
+#create-form h2 { font-size: 1.6rem; }
+.cf-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+.cf-duration { display: grid; grid-template-columns: 1fr auto; gap: 8px; }
+fieldset { border: 2px solid var(--sky); border-radius: var(--radius); padding: 14px 16px; margin: 0; display: grid; gap: 10px; }
+legend { font-weight: 700; padding: 0 6px; }
+#cf-milestones { margin: 0; padding-left: 1.6em; display: grid; gap: 10px; }
+#cf-milestones li::marker { font-weight: 800; }
+.cf-row > * { vertical-align: middle; }
+.cf-row { display: list-item; }
+.cf-row .cf-desc { width: calc(100% - 250px); }
+.cf-pct-wrap { display: inline-flex; width: 110px; margin: 0 8px; }
+.cf-tools { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; }
+.sum-ok { color: var(--green); font-weight: 700; }
+.sum-bad { color: var(--red); font-weight: 700; }
+.form-error { color: var(--red); font-weight: 700; min-height: 1.2em; }
+.dialog-actions { display: flex; justify-content: flex-end; gap: 12px; }
+
+/* ---------- responsive & motion ---------- */
+@media (max-width: 1100px) {
+  .grid2 { grid-template-columns: 1fr; }
+  .facts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 900px) {
+  html { font-size: 16px; }
+  .app { grid-template-columns: 1fr; padding: 16px 16px 120px; }
+  #list { position: static; max-height: none; overflow: visible; }
+  .tx:not(:first-child) { display: none; }
+  .topbar-inner, #banners { padding-left: 16px; padding-right: 16px; }
+  .brand-sub { display: none; }
+  .c-head h1 { font-size: 2rem; }
+  .escrow { height: 76px; }
+  .cf-grid { grid-template-columns: 1fr; }
+  .cf-row .cf-desc { width: 100%; margin-bottom: 6px; }
+  .tx { grid-template-columns: 22px minmax(0, 1fr); }
+  .tx-msg, .tx-link { grid-column: 2; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .seg-voting, .tx-pending .tx-icon { animation: none; }
+  .fund-bar span { transition: none; }
+}
+</style>
+</head>
+<body>
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="#" aria-label="PledgeLock home">
+      <svg viewBox="0 0 34 34" aria-hidden="true">
+        <rect x="5" y="14" width="24" height="18" rx="3" fill="#DFF37C"/>
+        <path d="M10 14V10a7 7 0 0 1 14 0v4" fill="none" stroke="#DFF37C" stroke-width="3.2" stroke-linecap="round"/>
+        <rect x="9" y="19" width="5" height="8" rx="1" fill="#183E55"/>
+        <rect x="15" y="22" width="5" height="5" rx="1" fill="#183E55" opacity=".55"/>
+        <rect x="21" y="24" width="4" height="3" rx="1" fill="#183E55" opacity=".3"/>
+      </svg>
+      <span class="brand-name">PledgeLock</span>
+      <span class="brand-sub">Crowdfunding that pays out milestone by milestone</span>
+    </a>
+    <div id="header-right"></div>
+  </div>
+</header>
+
+<div id="banners"></div>
+
+<main class="app">
+  <aside id="list" aria-label="Campaigns"></aside>
+  <section id="detail" aria-live="polite"></section>
+</main>
+
+<ul id="txlog" aria-live="polite" aria-label="Transaction status" hidden></ul>
+
+<dialog id="create-dialog" aria-labelledby="create-title">
+  <form id="create-form" novalidate>
+    <h2 id="create-title">New campaign</h2>
+    <label class="field"><span>Title</span><input id="cf-title" maxlength="80" placeholder="Solar backpack" autocomplete="off"></label>
+    <div class="cf-grid">
+      <label class="field"><span>Funding goal</span>
+        <span class="with-unit"><input id="cf-goal" inputmode="decimal" placeholder="0.03" autocomplete="off"><span>ETH</span></span></label>
+      <label class="field"><span>Funding phase</span>
+        <span class="cf-duration"><input id="cf-duration" type="number" min="1" step="1" value="90">
+          <select id="cf-unit" aria-label="Unit">
+            <option value="1" selected>seconds</option>
+            <option value="60">minutes</option>
+            <option value="3600">hours</option>
+            <option value="86400">days</option>
+          </select></span></label>
+    </div>
+    <fieldset>
+      <legend>Milestones: 1 to 5, shares add up to 100%</legend>
+      <ol id="cf-milestones"></ol>
+      <div class="cf-tools">
+        <button type="button" id="cf-add" class="btn btn-small btn-outline">Add milestone</button>
+        <span id="cf-sum" class="sum-ok"></span>
+      </div>
+    </fieldset>
+    <p id="cf-error" class="form-error" role="alert"></p>
+    <div class="dialog-actions">
+      <button type="button" id="cf-cancel" class="btn btn-outline">Cancel</button>
+      <button type="submit" class="btn btn-lime">Create campaign</button>
+    </div>
+  </form>
+</dialog>
+</body>
+</html>
